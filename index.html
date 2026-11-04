@@ -204,6 +204,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 20px; }
   <div class="panel" id="panel"></div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js"></script>
 <script>
 /* Данные по умолчанию. Менять их удобнее в админ-панели (кнопка ⚙ внизу справа). */
 const DEFAULTS = {
@@ -227,9 +228,57 @@ const DEFAULTS = {
   ]
 };
 
-const KEY = "dock_site_v2";
-let S = JSON.parse(localStorage.getItem(KEY) || "null") || JSON.parse(JSON.stringify(DEFAULTS));
-function save() { localStorage.setItem(KEY, JSON.stringify(S)); }
+const SB_URL = "https://bfmtfzsvvpgjqfanhdkm.supabase.co";
+const SB_KEY = "sb_publishable_2W8IALaexeYhxWhz-qPyBA_gDxCk-kg";
+const sb = window.supabase ? window.supabase.createClient(SB_URL, SB_KEY) : null;
+let S = JSON.parse(JSON.stringify(DEFAULTS));
+delete S.password;
+S.apps = [];
+let deletedIds = [];
+function save() {}
+const fromRow = r => ({ id: r.id, name: r.name, desc: r.description || "", image: r.image_url || "", price: r.price || "", open: !!r.is_open, file: r.file_url || "", badge: r.badge || "" });
+const toRow = a => ({ name: a.name, description: a.desc, image_url: a.image, price: a.price, is_open: !!a.open, file_url: a.file, badge: a.badge });
+
+async function load() {
+  try {
+    const r = await fetch(SB_URL + '/storage/v1/object/public/apk/settings.json?t=' + Date.now());
+    if (r.ok) Object.assign(S, await r.json());
+  } catch (e) {}
+  try {
+    const { data } = await sb.from('apps').select('*').order('id');
+    if (data) S.apps = data.map(fromRow);
+  } catch (e) {}
+  render();
+}
+
+async function uploadBlob(path, blob) {
+  const { error } = await sb.storage.from('apk').upload(path, blob, { contentType: blob.type || 'application/octet-stream' });
+  if (error) throw error;
+  return sb.storage.from('apk').getPublicUrl(path).data.publicUrl;
+}
+
+async function uploadImg(file, max, q) {
+  const im = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = URL.createObjectURL(file); });
+  const k = Math.min(1, max / Math.max(im.width, im.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(im.width * k);
+  c.height = Math.round(im.height * k);
+  c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', q));
+  return uploadBlob('img/' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.jpg', blob);
+}
+
+async function saveAll() {
+  const { apps, ...rest } = S;
+  const { error: e1 } = await sb.storage.from('apk').upload('settings.json', new Blob([JSON.stringify(rest)], { type: 'application/json' }), { upsert: true, cacheControl: '0', contentType: 'application/json' });
+  if (e1) throw e1;
+  for (const id of deletedIds) { const { error } = await sb.from('apps').delete().eq('id', id); if (error) throw error; }
+  deletedIds = [];
+  for (const a of S.apps) {
+    if (a.id > 0) { const { error } = await sb.from('apps').update(toRow(a)).eq('id', a.id); if (error) throw error; }
+    else { const { data, error } = await sb.from('apps').insert(toRow(a)).select().single(); if (error) throw error; a.id = data.id; }
+  }
+}
 function esc(t) { return String(t == null ? "" : t).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 let hue = 0;
@@ -276,7 +325,7 @@ function render() {
   if (S.telegram) links.push(`<a href="https://t.me/${esc(S.telegram)}" target="_blank" rel="noopener">Telegram</a>`);
   if (S.instagram) links.push(`<a href="${esc(S.instagram)}" target="_blank" rel="noopener">Instagram</a>`);
   if (S.vk) links.push(`<a href="${esc(S.vk)}" target="_blank" rel="noopener">ВКонтакте</a>`);
-  document.getElementById('contactlinks').innerHTML = links.join('') || '<p style="color:rgba(255,255,255,.6)">Контакты пока не заполнены. Открой админ-панель (⚙ внизу справа).</p>';
+  document.getElementById('contactlinks').innerHTML = links.join('') || '<p style="color:rgba(255,255,255,.6)">Контакты скоро появятся.</p>';
   const pb = document.getElementById('phonebtn');
   if (pb) pb.onclick = e => {
     e.preventDefault();
@@ -315,12 +364,28 @@ document.getElementById('clear').addEventListener('click', () => { cart.clear();
 const overlay = document.getElementById('overlay');
 const panel = document.getElementById('panel');
 
-document.getElementById('gear').addEventListener('click', () => {
-  const p = prompt('Пароль администратора:');
-  if (p === null) return;
-  if (p !== S.password) { alert('Неверный пароль'); return; }
-  openPanel();
+document.getElementById('gear').addEventListener('click', async () => {
+  if (!sb) { alert('Нет связи с базой данных'); return; }
+  const { data } = await sb.auth.getSession();
+  if (data && data.session) openPanel(); else openLogin();
 });
+
+function openLogin() {
+  panel.innerHTML = `<h2>Вход в админку</h2>
+  <label>Почта</label><input id="l_email" type="email" autocomplete="username">
+  <label>Пароль</label><input id="l_pass" type="password" autocomplete="current-password">
+  <div id="l_err" class="hint" style="color:#ff9b9b"></div>
+  <div style="margin-top:18px"><button class="btn dl" id="l_go">Войти</button> <button class="btn gray" id="l_close">Закрыть</button></div>`;
+  overlay.classList.add('show');
+  document.getElementById('l_close').onclick = () => overlay.classList.remove('show');
+  const go = async () => {
+    const { error } = await sb.auth.signInWithPassword({ email: document.getElementById('l_email').value.trim(), password: document.getElementById('l_pass').value });
+    if (error) { document.getElementById('l_err').textContent = 'Не удалось войти: ' + error.message; return; }
+    openPanel();
+  };
+  document.getElementById('l_go').onclick = go;
+  document.getElementById('l_pass').onkeydown = e => { if (e.key === 'Enter') go(); };
+}
 
 overlay.addEventListener('click', e => { if (e.target === overlay) overlay.classList.remove('show'); });
 
@@ -365,16 +430,15 @@ function openPanel() {
   </div>
 
   <h3>Приложения</h3>
-  <div class="hint">Ссылку на файл вставляй из Яндекс Диска: нажми «Поделиться» и скопируй публичную ссылку. Пока переключатель «Разрешить скачивание» выключен, человек видит только кнопку заказа.</div>
+  <div class="hint">Файл APK загружай кнопкой «Выбрать файл» у приложения (до 50 МБ). Пока переключатель «Разрешить скачивание» выключен, человек видит только кнопку заказа. Внизу не забудь нажать «Сохранить».</div>
   <div id="applist"></div>
   <button class="btn" id="addapp">+ Добавить приложение</button>
 
-  <h3>Пароль</h3>
-  <label>Новый пароль (оставь пустым, если менять не нужно)</label><input id="a_pass" type="password">
 
   <div style="margin-top:22px">
     <button class="btn dl" id="savebtn">Сохранить</button>
     <button class="btn gray" id="closebtn">Закрыть</button>
+    <button class="btn gray" id="logoutbtn">Выйти из аккаунта</button>
   </div>`;
   panel.innerHTML = html;
   drawApps();
@@ -387,36 +451,25 @@ function openPanel() {
     const pv = document.getElementById('a_bannerPrev'); pv.src = ''; pv.style.display = 'none';
     document.getElementById('a_bannerFile').value = '';
   };
-  document.getElementById('a_bannerFile').onchange = e => {
+  document.getElementById('a_bannerFile').onchange = async e => {
     const file = e.target.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const im = new Image();
-      im.onload = () => {
-        const max = 1600;
-        const k = Math.min(1, max / Math.max(im.width, im.height));
-        const c = document.createElement('canvas');
-        c.width = Math.round(im.width * k);
-        c.height = Math.round(im.height * k);
-        c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
-        S.banner = c.toDataURL('image/jpeg', 0.82);
-        const pv = document.getElementById('a_bannerPrev'); pv.src = S.banner; pv.style.display = '';
-      };
-      im.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
+    try {
+      S.banner = await uploadImg(file, 1600, 0.82);
+      const pv = document.getElementById('a_bannerPrev'); pv.src = S.banner; pv.style.display = '';
+    } catch (err) { alert('Не удалось загрузить картинку: ' + (err.message || err)); }
   };
   document.getElementById('a_barOpacity').oninput = e => document.documentElement.style.setProperty('--bar-op', e.target.value / 100);
 
   document.getElementById('addapp').onclick = () => {
     readApps();
-    const nid = S.apps.reduce((m, a) => Math.max(m, a.id), 0) + 1;
-    S.apps.push({ id: nid, name: "Новое приложение", desc: "", image: "", price: "", open: false, file: "", badge: "", downloads: 0, orders: 0 });
+    S.apps.push({ id: -Date.now(), name: "Новое приложение", desc: "", image: "", price: "", open: false, file: "", badge: "" });
     drawApps();
   };
   document.getElementById('closebtn').onclick = () => overlay.classList.remove('show');
-  document.getElementById('savebtn').onclick = () => {
+  document.getElementById('logoutbtn').onclick = async () => { await sb.auth.signOut(); overlay.classList.remove('show'); };
+  document.getElementById('savebtn').onclick = async () => {
+    const btn = document.getElementById('savebtn');
     S.siteName = document.getElementById('a_siteName').value.trim() || "Dock";
     S.tagline = document.getElementById('a_tagline').value;
     S.headerStyle = document.getElementById('a_headerStyle').value;
@@ -427,15 +480,14 @@ function openPanel() {
     S.about = document.getElementById('a_about').value;
     S.telegram = document.getElementById('a_telegram').value.replace('@', '').trim();
     S.phone = document.getElementById('a_phone').value.trim();
-    S.whatsapp = document.getElementById('a_whatsapp').value.replace(/\D/g, '');
+    S.whatsapp = document.getElementById('a_whatsapp').value.replace(/\\D/g, '');
     S.vk = document.getElementById('a_vk').value.trim();
     S.instagram = document.getElementById('a_instagram').value.trim();
     readApps();
-    const np = document.getElementById('a_pass').value;
-    if (np) S.password = np;
-    save();
-    render();
-    overlay.classList.remove('show');
+    btn.disabled = true; btn.textContent = 'Сохраняю…';
+    try { await saveAll(); render(); overlay.classList.remove('show'); }
+    catch (err) { alert('Не удалось сохранить: ' + (err.message || err)); }
+    btn.disabled = false; btn.textContent = 'Сохранить';
   };
 }
 
@@ -454,7 +506,6 @@ function drawApps() {
         <option value="new" ${a.badge === 'new' ? 'selected' : ''}>Новинка</option>
         <option value="sale" ${a.badge === 'sale' ? 'selected' : ''}>Акция</option>
       </select>
-      <div class="hint" style="font-size:14px;color:#fff">Скачали: ${a.downloads || 0} · Добавили в корзину: ${a.orders || 0}</div>
       <label>Описание</label><textarea data-f="desc">${esc(a.desc)}</textarea>
       <label>Картинка (необязательно)</label>
       <div class="row" style="align-items:center">
@@ -462,34 +513,38 @@ function drawApps() {
         <input type="file" accept="image/*" data-pick="${i}">
       </div>
       <input type="hidden" data-f="image" value="${esc(a.image)}">
-      <label>Ссылка на файл (Яндекс Диск)</label><input data-f="file" value="${esc(a.file)}">
+      <label>Файл APK</label>
+      <input type="file" data-apk="${i}"><div class="hint" style="font-size:13px">${a.file ? 'Загружен: ' + esc(a.file.split('/').pop()) : 'Файл не выбран'}</div>
+      <input data-f="file" value="${esc(a.file)}" placeholder="или вставь ссылку вручную">
       <div class="switch"><input type="checkbox" data-f="open" ${a.open ? 'checked' : ''}> Разрешить скачивание</div>
       <button class="btn gray" data-del="${i}">Удалить</button>
     </div>`).join('');
-  box.querySelectorAll('[data-pick]').forEach(inp => inp.onchange = () => {
+  box.querySelectorAll('[data-pick]').forEach(inp => inp.onchange = async () => {
     const file = inp.files[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const im = new Image();
-      im.onload = () => {
-        const max = 600;
-        const k = Math.min(1, max / Math.max(im.width, im.height));
-        const c = document.createElement('canvas');
-        c.width = Math.round(im.width * k);
-        c.height = Math.round(im.height * k);
-        c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
-        readApps();
-        S.apps[Number(inp.dataset.pick)].image = c.toDataURL('image/jpeg', 0.8);
-        drawApps();
-      };
-      im.src = ev.target.result;
-    };
-    reader.readAsDataURL(file);
+    try {
+      const url = await uploadImg(file, 600, 0.8);
+      readApps();
+      S.apps[Number(inp.dataset.pick)].image = url;
+      drawApps();
+    } catch (err) { alert('Не удалось загрузить картинку: ' + (err.message || err)); }
+  });
+  box.querySelectorAll('[data-apk]').forEach(inp => inp.onchange = async () => {
+    const file = inp.files[0];
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) { alert('Файл больше 50 МБ, на бесплатном тарифе он не загрузится.'); inp.value = ''; return; }
+    const hint = inp.nextElementSibling; hint.textContent = 'Загружаю…';
+    try {
+      const url = await uploadBlob('files/' + Date.now() + '-' + file.name.replace(/[^\\w.\\-]+/g, '_'), file);
+      readApps();
+      S.apps[Number(inp.dataset.apk)].file = url;
+      drawApps();
+    } catch (err) { hint.textContent = 'Ошибка: ' + (err.message || err); }
   });
   box.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
     readApps();
-    S.apps.splice(Number(b.dataset.del), 1);
+    const rm = S.apps.splice(Number(b.dataset.del), 1)[0];
+    if (rm && rm.id > 0) deletedIds.push(rm.id);
     drawApps();
   });
 }
@@ -506,6 +561,7 @@ function readApps() {
 }
 
 render();
+load();
 </script>
 </body>
 </html>
